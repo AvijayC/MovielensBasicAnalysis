@@ -1,0 +1,411 @@
+---
+title: "Movielens Project"
+subtitle: "HarvardX Data Science - Course 9"
+author: "Avijay Chakravorti"
+date: "8/29/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("movielens_analysis_script.R", echo=TRUE) # Execute R Script to get variables.
+```
+
+# Section 1: Overview
+
+## 1.1: Project Goals
+
+This project aims to use the Movielens dataset to construct a recommender system, which will predict what rating a user will give a movie based on many previous ratings, the type of movie, etc.
+
+Our **key steps** are listed below:
+
+1.  Movielens data exploration using plots, filtering, grouping, etc.
+2.  Execution of methods from the "Machine Learning" course to act as a baseline to improve upon
+3.  Construction of a better method to predict user ratings
+4.  Generation of a predicted ratings dataset and RMSE \< 0.8640 on the validation set.
+
+## 1.2: What is the Movielens Dataset?
+
+The 10-million row subset of the Movielens dataset to be used in this report can be downloaded from <http://files.grouplens.org/datasets/movielens/ml-10m.zip>. The full-sized dataset is too big for most home computers to handle.
+
+The dataset is in a **tidy** format. This means each row corresponds to a single rating, by a single user, on a single movie. We split the downloaded data into 2 sets:
+
+-   **edx** dataset: to be used for all model training, tuning and testing
+
+-   **validation** dataset: to be used for final model evaluation only.
+
+Here are the first 2 rows (observations) in the edx dataset.
+
+```{r DataExploration_MovielensHead, echo=FALSE}
+head(edx_df,1)[,1:6]
+```
+
+[Explanation of Columns:]{.ul}
+
+-   userId: unique-per-user ID.
+-   movieId: unique-per-movie ID.
+-   rating: rating the user gives the movie
+-   timestamp: UNIX timestamp for when the rating was recorded.
+-   title: movie title
+-   genres: string containing all applicable movie genres separated by "\|"
+
+We will mutate and prepare this data for analysis in Section 2.
+
+# Section 2: Methods / Analysis
+
+## 2.1: Data Exploration on pre-prediction edx dataset
+
+Before we jump into modelling, let's explore the general trends the original data gives us. We will mutate the existing ratings data to make it easier to group by time, rating, movie, etc. but will not perform predictions yet.
+
+Here's a head of a sample of the edx dataset:
+
+```{r}
+sample_n(edx_df, 5)[1:5, 1:6]
+```
+
+Let's look at the **general distribution of all ratings**.
+
+```{r DataExploration_Ratings, echo=FALSE}
+hist(edx_df$rating)
+```
+
+We see that full-star ratings (1, 2, 3, 4, 5) are much more common than half-star ratings (0.5, 1.5, 2.5, 3.5, 4.5). We know the range of ratings is from 0.5 to 5, which will be helpful when limiting our predictions later. The ratings do not appear normally distributed; users seem to more frequently rate 3 or 4 stars.
+
+Let's see if the rating's age affects the rating. Here's a scatterplot of **rating vs. timestamp**, for a small random sample of the data:
+
+```{r DataExploration_RatingsvsTime, echo=FALSE}
+edx_temp <- sample_n(edx_df, 100000)
+edx_temp %>% ggplot(aes(x=timestamp, y=rating)) + geom_point() + ggtitle("Ratings vs. Timestamp")
+```
+
+This is useful! Ratings are full-star ratings before a timestamp of approximately 1.05\*10^9^ . After this, ratings can be full or partial-star ratings. This means we can refine our predictions by grouping them around whole-stars before the timestamp 1.05\*10\^9.
+
+Let's see if the month plays any role on the rating, with a bar plot of **number of ratings vs. month.**
+
+```{r DataExploration_NumRatingsVsMonth, echo=FALSE}
+edx_temp %>% ggplot(aes(x=month_num, y=rating)) + geom_bar(stat="identity") + ggtitle("Number of Ratings vs. Month Number")
+```
+
+We see that more ratings take place during the festive months (November, December) since many people go to watch movies during those times.
+
+Let's look at **average rating vs. year of the rating.**
+
+```{r DataExploration_AvgRatingvsYear, echo=FALSE}
+edx_temp %>% group_by(year) %>% summarize(avg_rating = mean(rating)) %>%
+  ggplot(aes(x=year, y=avg_rating)) + geom_point() + ggtitle("Avg. Rating vs Year")
+
+```
+
+Overall, on average, movie ratings seem to decrease slightly as the year increases. This would suggest movies overall are recieved more poorly as time goes on, or more movies with subpar quality are flooding the overall market (until 2005, where an upward trend begins again).
+
+If we look at the correlation of **average rating vs. month number:**
+
+```{r DataExploration_AvgRatingvsMonth, echo=FALSE}
+tempdf_2 <- edx_temp %>% group_by(month_num) %>% summarize(avg_rating = mean(rating))
+
+cat("Correlation of average rating vs. month number = ", cor(tempdf_2$avg_rating, tempdf_2$month_num))
+#tempdf_2
+
+tempdf_2 %>% ggplot(aes(x=month_num, y=avg_rating)) + geom_point() + ggtitle("Average Rating vs. Month Number")
+rm(tempdf_2)
+```
+
+There is a moderate positive correlation visible between month number and average rating, but this doesn't appear strong enough to compete with the methods used in course 8 (looking at average user and movie ratings). We will stick with our approach of trying to predict ratings using genres, in addition to the methods from course 8. A possible explanation for this could be that festive movies tend to make audiences feel happier, and/or audiences tend to watch these movies with friends and family more during the winter months, leading to a more positive experience and thus a higher rating.
+
+### 2.1.1: Initial data exploration conclusions
+
+We see that time does play a factor in rating averages, but still believe a genre-based approach is the best as this has more data (\~ 20 genres, with user-by-user preferences). Ratings are seen to be not normally distributed. We also notice an important trend in rating resolution, where ratings before a certain time are whole-star ratings only.
+
+## 2.2: Modelling Thought Process
+
+It can be argued that a user's tastes (their genre preferences) are the most important factor to decide how they will rate a movie. Second to that, would be the user's average rating (whether they underrate or overrate most movies) and the movie's average rating (how well the movie was recieved). These factors combined should achieve our goal of creating a recommendation system that achieves our target RMSE.
+
+While commercial recommendation systems no doubt take into account time-based trends of a user's purchases, selections, etc., they place much of their weight on the user's tastes, as this personalizes the recommendations for this user the best. We will follow this same strategy in our model.
+
+## 2.3: Preparing the Data for Analysis (Course 8 Methods)
+
+### 2.3.1: Generating dataframes of average movie and average user ratings
+
+We first generate matrices of average user and average movie ratings. To achieve this, we use the **dplyr** package, group by the movieId, and generate a summary dataframe with movieIds and average ratings.
+
+We repeat this for userId and average_ratings per movie to get a dataframe of each user's average rating.
+
+These matrices are represented here, with a small sample of the full edx dataset.
+
+[User Ratings Dataframe Sample:]{.ul}
+
+```{r echo=TRUE}
+head(edx_temp %>% group_by(userId) %>% summarize(avg_user_rating = mean(rating)), 6)
+```
+
+[Movie Ratings Dataframe Sample]{.ul}
+
+```{r}
+head(edx_temp %>% group_by(movieId) %>% summarize(avg_movie_rating = mean(rating)), 6)
+```
+
+We then **join these dataframes** to the edx dataframe. Now, each row in the edx dataframe has two additional columns:
+
+-   avg_user_rating: average rating for the user in that row
+
+-   avg_movie_rating: average rating for the movie in that row
+
+Our baseline model looks like this.$$
+Y_{i,u,m} = y_{mean} + b_u + b_m + \varepsilon 
+$$
+
+-   Y_ium = actual (true) rating for observation i, which has user u and movie m
+-   y_mean = mean rating across the entire training dataset
+-   i = row number
+-   u = user u's average rating
+-   m = movie m's average rating
+-   epsilon = prediction error (must reduce this using more variables to predict with)
+
+**This is the same model that was used in the previous course. This IS NOT the final model. This only serves as a baseline to beat using our own method later.**
+
+## 2.4: Adding "multi-hot" Genre Vectors to Every Observation
+
+A little bit of terminology refresh:
+
+-   **One-hot vector:** Converts a class into a vector of the same length as every possible class.
+
+    -   1 placed in the vector element corresponding to the class of the observation
+
+    -   0 placed everywhere else in the vector.
+
+-   **Multi-hot vector:** Same as one-hot, except there can be **multiple 1's** in the vector (since there can be multiple classes assigned to a single observation)
+
+    -   This is what we're going to generate for every row in the movielens dataset.
+
+### 2.4.1: Splitting the "genre" column into a list of genres
+
+We use the str_split function with the separator "\|" to split the "genre" field into a list of individual genres (1 list per row). An example of the results is shown below:
+
+```{r echo=TRUE}
+edx_df[1:6, c("genres", "genres_list")]
+```
+
+### 2.4.2: Using lapply() to generate a multi-hot vector for every row
+
+We find all unique genres by using the unique() function on the genres_list column of the edx dataset. We get approximately 20 unique genres:
+
+```{r echo=TRUE}
+unique_genres
+```
+
+Next, we use the lapply function to do the following to each row:
+
+1.  Unlist the contents of "genres_list"
+2.  Use dplyr's %in% to see which elements of unique_genres are in that row's genre_list.
+3.  Generate a logical vector (true/false) based on step 2.
+4.  Convert this logical vector to a vector of 0's and 1's by multiplying the vector by 1.
+5.  Do this for every row.
+
+We do this for both the **edx dataframe and validation dataframe.**
+
+We end up getting an edx dataframe like so:
+
+```{r}
+head(edx_df,2)
+
+```
+
+The multi-hot vector's columns are named g_1 to g_20, representing genres in the same order as the unique_genres vector above.
+
+-   g_1 represents if a movie has the "Comedy" genre
+-   g_2 represents if a movie has the "Romance" genre
+-   . . .
+-   g_20 represents if a movie has the "(no genres listed)" genre
+
+Looking at row 1, you will notice there is a 1 for g_1, since the movie is in fact a comedy. There's also a 1 in g_2 column, since this movie is also a romantic movie. There are 0's for every other column, since this movie isn't classified with those genres.
+
+Now we have successfully added multi-hot genre vectors to every row of all the ratings data.
+
+## 2.5: Train / Test / Tune Split
+
+Before we proceed, we must split the data into training, testing and tuning sets.
+
+We use the following architecture for our datasets:
+
+-   Entire Movielens 10M Dataset
+
+    -   Edx dataset: p = 0.9
+
+        -   Train_all dataset: p = 0.9
+
+            -   Train dataset: p = 0.95
+
+            -   Tune dataset: p = 0.05\
+
+        -   Test dataset: p = 0.1\
+
+    -   Validation dataset: p = 0.1
+
+We can see the number of rows for all of them here:
+
+```{r echo=TRUE}
+nrow(edx_df)
+nrow(train_set)
+nrow(test_set)
+nrow(tune_set)
+nrow(validation_df)
+
+```
+
+## 2.6: Generating User-specific Genre Preferences
+
+### 2.6.1: Generating a User vs. Genre preference matrix using the train dataset only
+
+We now need to gain insights into which genres a user likes or dislikes. Here's our technique for doing this, **for each row.** This matrix will be 20 columns wide, with the same number of rows as unique users in the training set.
+
+1.  Take the predicted rating based on user and movie average ratings (from course 8 methods).
+2.  See the error from our predicted ratings using the previous course's methods.\
+    $$
+    {\textrm{Error}} = Y_{i,u,m} - y_{mean} + b_u + b_m
+    $$
+3.  Multiply the multi-hot genre vector (with columns g_1 to g_20) by the error from step 2
+
+Then, we group by userId and summarize the multi-hot vectors by **averaging them for individual users.**
+
+Here's what we end up with:
+
+```{r echo=TRUE}
+head(user_genre_df_train_collapsed, 3)
+```
+
+The columns ug_1 to ug_20 stand for the user's average preference across all ratings given by that specific user, for that genre.
+
+1.  ug_1 stands for this user's preference for "Comedy"
+2.  ug_2 stands for this user's preference for "Romance"
+3.  . . .
+4.  ug_20 stands for this user's preference for "(no genre listed)"
+
+Positive means the **user likes the genre,** negative means the **user dislikes the genre.**
+
+### 2.6.2: Joining the user genre preferences to each row in train dataframe
+
+To complete this part of data preparation, we join the user genre preferences to every row in the train dataframe. Here's a small subset of the newly modified train dataframe.
+
+(Ignore columns not mentioned yet, they were used for debugging).
+
+```{r echo=TRUE}
+head(train_set,1)
+```
+
+### 2.6.3: Joining the user genre preferences to tune, test and validation sets
+
+**Remember: The user genre preference matrix was generated only with data from the TRAIN dataset.**
+
+We join the genre preferences to the other datasets so we can use them for prediction later.
+
+# Section 3: Predictions and Results
+
+## 3.1: Prediction Results using Course 8 Methods
+
+Generating predictions using this model from course 8, we get the following RMSEs:
+
+```{r echo=TRUE}
+test_rmses[c("average", "movieonly", "useronly", "movieanduser")]
+```
+
+-   "average" RMSE: predicts using the average rating for all rows
+-   "movieonly": also uses movie average ratings to predict
+-   "useronly": also uses user average ratings to predict
+-   "movieanduser": also uses both average movie and average user ratings to predict
+
+We see that using both b_u and b_m , we get an RMSE of \~ 0.88. We must improve upon this.
+
+## 3.2: Prediction Results using Genre-Augmented Method - Test Set
+
+### 3.2.1: Summing up the user genre preference vector for every row
+
+We sum up the user genre preference **vector** (a single row of the user genre preference matrix, for the userId associated with the rating we're looking at).
+
+We then multiply this sum by a hyperparameter called **lambda.** Then, we add this sum to the rating predicted by the course 8 methods. By default, lambda is set to 0.1 to begin with. This will be tuned next.
+
+### 3.2.2: Tuning lambda using a for loop
+
+We tune lambda using a for loop by changing it over a range from 0 to 3, with steps of 0.1. We record the results on the train set here, showing a subset of the RMSE / lambda pairs.
+
+```{r echo=FALSE}
+cat("Subset of RMSE / lambda matrix for train set. RMSE is col 1, lambda is col 2. \n")
+temp_rmse_train[15:21,]
+```
+
+But remember, we need to tune this for new data the algorithm hasn't seen before. Thus, we tune lambda on the **tune set. This is what will be used to decide what lambda shall be.**
+
+```{r echo=FALSE}
+cat("Subset of RMSE / lambda matrix for TUNE set. RMSE is col 1, lambda is col 2. \n")
+temp_rmse_tune[12:18,]
+```
+
+### 3.2.3: Evaluating tuned lambda on test set
+
+We determine the best lambda, according to tuning on the tune set, is \~ 1.3. We apply this to the test set to get our model's test RMSE, for comparison with the baseline course 8 model. The RMSE under "movieusergenre" takes into account all of course 8's variables (movie and user avgs) as well as user genre preference.
+
+```{r echo=FALSE}
+test_rmses[4:5]
+
+```
+
+We see quite an improvement with our genre-augmented model.
+
+### 3.2.4: Common sense prediction limits
+
+We can trim our predictions to be between 0 and 5, since a rating cannot be negative and cannot be greater than 5. This should improve overall accuracy.
+
+The edge-limited test RMSE is in the last column, as "movieusergenre_edgelimited".
+
+```{r echo=FALSE}
+test_rmses[4:6]
+```
+
+We see a slight improvement.
+
+## 3.3: Prediction Results using Genre-Augmented Method - Validation Set
+
+We run the same procedure seen above for the test set, using our optimal lambda = 1.3, on our validation set.
+
+We obtain:
+
+```{r echo=TRUE}
+val_rmse_final
+```
+
+All RMSEs were calculated using the recommenderlab RMSE function.
+
+Here's a sampled subset of the prediction-augmented validation dataset.
+
+```{r echo=FALSE}
+sample_n(val_set[, c("userId", "movieId", "title", "genres","rating", "genre_pred_rating")], 5)
+```
+
+As we can see, the ratings can differ often by approximately 1 star. This means this recommender system is not production-level accurate, and should probably not be deployed to any consumer-facing systems. However, the approach seen here does begin to take into account user behavior, which, if expanded upon, can dramatically improve model performance and truly personalize the user's predictions.
+
+# Section 4: Conclusion
+
+## 4.1: Summary of Goals
+
+In this report, we successfully delivered on the following goals:
+
+1.  Conduct a surface-level analysis of the given movielens data
+
+2.  Run well-established, previously provided models from Course 8 to identify a baseline for improvement.
+
+    -   **RMSE using both user and movie averages is \~ 0.88.**
+
+3.  Modify the data by creating multi-hot vectors representing whether each genre was present in a given movie.
+
+4.  Generate a matrix of user genre preferences to gain insight into what a user likes / dislikes, as well as to make predictions with later.
+
+5.  Create a model that predicts user rating with an RMSE of less than 0.8640, **achieving an RMSE of \~0.857.**
+
+## 4.2: Limitations
+
+This code was optimized over 3 full iterations, and should run on a standard laptop with at least 16 GB of RAM. The usage of built-in functions such as lapply allow for runtimes that are 100 (or more) times faster than a for loop iterating row-by-row. However, this code is far from perfect, and further savings of computational resources (especially memory) can most definitely be achieved with removal of unused variables, frequent memory cleaning, and more efficient (but harder to read) code.
+
+This model also doesn't take advantage of fuzzy clustering (grouping ratings closer to the distinct categories seen in the data). The parameters of this clustering must be tuned, but can result in more interpretable ratings that closely align with the 5 star system.
+
+We can also factor in average rating trends over time in a future model, which takes into account the average rating for that movie in a given year, to appropriately scale a prediction for that movie in that year. Doing this for users probably won't help much, since a user doesn't tend to rate a single movie many times (and the insight gained from predicting something like this would be redundant and minimal).
+
+In the end, this model isn't production ready and must be refined with addtional data and more features / meta-features. However, this does serve as a good springboard for more advanced user-specific recommendation systems, and gives us insight into a user's genre preferences.
